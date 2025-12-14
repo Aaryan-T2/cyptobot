@@ -7,13 +7,13 @@ import os
 import time
 import ccxt
 import pandas as pd
+import numpy as np
 import threading
 from flask import Flask, jsonify
 import requests
 import logging
 from datetime import datetime, timezone
 from collections import defaultdict
-import numpy as np
 
 # ======================================================
 # LOGGING SETUP
@@ -114,25 +114,28 @@ def send_telegram(text: str):
 
 def send_startup():
     msg = (
-        "🚀 *SCALPER 2.0 — INSTITUTIONAL GRADE*\n\n"
-        "📊 *ENHANCED FEATURES:*\n"
-        "• Micro regime filter (dual-timeframe)\n"
-        "• Dynamic dealing range (impulse-based)\n"
-        "• Liquidity distance constraint\n"
-        "• Session momentum windows\n"
-        "• EMA compression → expansion\n"
-        "• Structure-based SL (ATR buffered)\n"
-        "• Tiered profit targets\n\n"
+        "🚀 *SCALPER 2.0 — ACTIVE 24/7*\n\n"
+        "📊 *CORE FILTERS:*\n"
+        "• Dual-timeframe regime (relaxed)\n"
+        "• Trend alignment (EMA 9/20/50)\n"
+        "• Displacement confirmation\n"
+        "• Liquidity distance check\n"
+        "• Structure-based SL (2.0-2.5× ATR)\n"
+        "• Tiered profit targets (1.5R+)\n\n"
         "🧠 *LEARNING SYSTEM:*\n"
         "• Tracks stop hunts & fake breakouts\n"
         "• Learns optimal contexts\n"
         "• Auto-filters low-quality setups\n"
         "• Adapts confidence thresholds\n"
-        "• Detailed win/loss analysis\n\n"
-        "⚡ *TARGET METRICS:*\n"
+        "• Session performance tracking\n\n"
+        "⚡ *SIGNAL FREQUENCY:*\n"
+        "• Balanced filters for quality\n"
+        "• 24/7 scanning (no session restrictions)\n"
+        "• Top 15 movers per exchange\n"
+        "• 15-second scan interval\n\n"
+        "🎯 *TARGET METRICS:*\n"
         "• Win Rate: 55-65%\n"
-        "• Avg R:R: 1.5-2.5\n"
-        "• Focus: Quality over quantity\n\n"
+        "• Avg R:R: 1.5-2.5\n\n"
         "Scanner active — hunting high-probability setups ✅"
     )
     send_telegram(msg)
@@ -228,18 +231,51 @@ def detect_top_movers(ex):
     pairs = get_pairs(ex)
     
     for s in pairs:
-        df = get_df(ex, s, "15m")
-        if df is None or len(df) < 20:
+        try:
+            df = get_df(ex, s, "15m")
+            if df is None or len(df) < 20:
+                continue
+            
+            # Check for valid data
+            if df["close"].iloc[-1] <= 0 or df["close"].iloc[-5] <= 0:
+                continue
+            
+            # Focus on volume + momentum
+            pct_change = (df["close"].iloc[-1] - df["close"].iloc[-5]) / df["close"].iloc[-5] * 100
+            
+            # Safe volume ratio
+            vol_mean = df["vol_mean"].iloc[-1]
+            if vol_mean > 0:
+                vol_ratio = df["volume"].iloc[-1] / vol_mean
+            else:
+                vol_ratio = 1.0
+            
+            # Safe ATR expansion (FIX FOR THE BUG)
+            atr_curr = df["atr"].iloc[-1]
+            atr_mean = df["atr_mean"].iloc[-1]
+            
+            if atr_mean > 0 and not pd.isna(atr_mean) and not pd.isna(atr_curr):
+                atr_expansion = atr_curr / atr_mean
+            else:
+                atr_expansion = 1.0  # Neutral if ATR invalid
+            
+            # Skip if we got NaN anywhere
+            if pd.isna(pct_change) or pd.isna(vol_ratio) or pd.isna(atr_expansion):
+                continue
+            
+            # Weighted scoring favoring volume + volatility
+            score = (abs(pct_change) * 0.4) + (vol_ratio * 0.35) + (atr_expansion * 0.25)
+            
+            if not pd.isna(score) and score > 0:
+                movers.append((s, score))
+        
+        except Exception as e:
+            # Skip problematic pairs silently
             continue
-        
-        # Focus on volume + momentum
-        pct_change = (df["close"].iloc[-1] - df["close"].iloc[-5]) / df["close"].iloc[-5] * 100
-        vol_ratio = df["vol_ratio"].iloc[-1]
-        atr_expansion = df["atr"].iloc[-1] / df["atr_mean"].iloc[-1]
-        
-        # Weighted scoring favoring volume + volatility
-        score = (abs(pct_change) * 0.4) + (vol_ratio * 0.35) + (atr_expansion * 0.25)
-        movers.append((s, score))
+    
+    if len(movers) == 0:
+        log.warning("No valid movers found - check data quality")
+        return []
     
     movers_sorted = sorted(movers, key=lambda x: x[1], reverse=True)
     return [m[0] for m in movers_sorted[:TOP_MOVER_COUNT]]
@@ -250,33 +286,56 @@ def detect_top_movers(ex):
 
 def check_regime(df_ltf, df_htf):
     """
-    Dual-timeframe regime check.
-    Both timeframes must show expansion simultaneously.
+    Dual-timeframe regime check (RELAXED).
+    Focuses on LTF expansion primarily.
     """
-    # HTF expansion
-    htf_atr_ok = df_htf["atr"].iloc[-1] > df_htf["atr_mean"].iloc[-1]
+    # Safety checks for valid data
+    if pd.isna(df_htf["atr"].iloc[-1]) or pd.isna(df_htf["atr_mean"].iloc[-1]):
+        return False, "invalid_htf_atr"
+    if pd.isna(df_ltf["atr"].iloc[-1]) or pd.isna(df_ltf["atr_mean"].iloc[-1]):
+        return False, "invalid_ltf_atr"
     
-    # LTF expansion
-    ltf_atr_ok = df_ltf["atr"].iloc[-1] > df_ltf["atr_mean"].iloc[-1]
-    ltf_vol_ok = df_ltf["vol_ratio"].iloc[-1] > 1.0
+    # HTF expansion (relaxed - just needs to not be contracting)
+    htf_atr_ok = df_htf["atr"].iloc[-1] >= df_htf["atr_mean"].iloc[-1] * 0.95  # Relaxed
+    
+    # LTF expansion (more important for scalping)
+    ltf_atr_ok = df_ltf["atr"].iloc[-1] > df_ltf["atr_mean"].iloc[-1] * 0.9  # Relaxed
+    ltf_vol_ok = df_ltf["vol_ratio"].iloc[-1] > 0.8  # Relaxed from 1.0
     
     # KILL SWITCH: HTF expanding but LTF contracting = divergence
     htf_expanding = df_htf["atr"].iloc[-1] > df_htf["atr"].iloc[-2]
-    ltf_contracting = df_ltf["atr"].iloc[-1] < df_ltf["atr"].iloc[-2]
+    ltf_contracting = df_ltf["atr"].iloc[-1] < df_ltf["atr"].iloc[-2] * 0.95
     
     if htf_expanding and ltf_contracting:
         return False, "regime_divergence"
     
-    if htf_atr_ok and ltf_atr_ok and ltf_vol_ok:
+    # Accept if LTF looks good (even if HTF is weak)
+    if ltf_atr_ok and ltf_vol_ok:
         return True, "clean_expansion"
     
     return False, "low_volatility"
 
 def categorize_regime(df_ltf, df_htf):
     """Categorize regime strength for position sizing."""
-    htf_strength = df_htf["atr"].iloc[-1] / df_htf["atr_mean"].iloc[-1]
-    ltf_strength = df_ltf["atr"].iloc[-1] / df_ltf["atr_mean"].iloc[-1]
+    # Safe division
+    htf_atr = df_htf["atr"].iloc[-1]
+    htf_mean = df_htf["atr_mean"].iloc[-1]
+    ltf_atr = df_ltf["atr"].iloc[-1]
+    ltf_mean = df_ltf["atr_mean"].iloc[-1]
+    
+    if htf_mean > 0 and not pd.isna(htf_mean):
+        htf_strength = htf_atr / htf_mean
+    else:
+        htf_strength = 1.0
+    
+    if ltf_mean > 0 and not pd.isna(ltf_mean):
+        ltf_strength = ltf_atr / ltf_mean
+    else:
+        ltf_strength = 1.0
+    
     vol_strength = df_ltf["vol_ratio"].iloc[-1]
+    if pd.isna(vol_strength):
+        vol_strength = 1.0
     
     avg_strength = (htf_strength + ltf_strength + vol_strength) / 3
     
@@ -378,7 +437,7 @@ def check_liquidity_distance(price, direction, df, atr):
 # ======================================================
 
 def get_trading_session():
-    """Get current session with strict windows."""
+    """Get current session (for tracking only, not filtering)."""
     now = datetime.now(timezone.utc)
     hour = now.hour
     minute = now.minute
@@ -395,8 +454,8 @@ def get_trading_session():
     return "off_hours"
 
 def session_momentum_ok(session):
-    """Only trade during premium session windows."""
-    return session in ["london_open", "ny_open"]
+    """Allow all sessions - we track but don't filter."""
+    return True  # Changed: Always return True
 
 # ======================================================
 # LAYER 5 — DISPLACEMENT CONFIRMATION
@@ -458,24 +517,24 @@ def analyze_long_setup(df5, df15):
     if not trend_ok:
         return False, "trend_misalignment"
     
-    # Session check
+    # Session check (now always passes, but logged for learning)
     session = get_trading_session()
-    if not session_momentum_ok(session):
-        return False, "off_session"
+    # Removed: if not session_momentum_ok(session): return False
     
-    # Dealing range (must be in discount)
+    # Dealing range (optional - warn but don't filter)
     range_low, range_high = calculate_dealing_range(df15, "LONG")
     current_price = df5["close"].iloc[-1]
     
+    in_zone = True
     if range_low and range_high:
-        if not (range_low <= current_price <= range_high):
-            return False, "outside_discount_zone"
+        in_zone = (range_low <= current_price <= range_high)
+    # Changed: Don't filter, just track for learning
     
-    # EMA compression → expansion
-    if not check_ema_setup(df5):
-        return False, "no_ema_setup"
+    # EMA compression → expansion (relaxed)
+    ema_setup = check_ema_setup(df5)
+    # Changed: Warn but don't filter
     
-    # Displacement confirmation
+    # Displacement confirmation (still required)
     last_candle = df5.iloc[-1]
     atr = last_candle["atr"]
     vol_mean = df5["vol_mean"].iloc[-1]
@@ -483,13 +542,13 @@ def analyze_long_setup(df5, df15):
     if not check_displacement(last_candle, atr, vol_mean):
         return False, "weak_displacement"
     
-    # Liquidity distance
-    if not check_liquidity_distance(current_price, "LONG", df5, atr):
+    # Liquidity distance (relaxed to 1.0× ATR instead of 1.5×)
+    if not check_liquidity_distance_relaxed(current_price, "LONG", df5, atr):
         return False, "too_close_to_liquidity"
     
     # Breakout confirmation
     recent_high = df5["high"].iloc[-5:-1].max()
-    if current_price <= recent_high * 1.0005:
+    if current_price <= recent_high * 1.0003:  # Relaxed from 1.0005
         return False, "no_breakout"
     
     return True, "valid_long_setup"
@@ -510,24 +569,24 @@ def analyze_short_setup(df5, df15):
     if not trend_ok:
         return False, "trend_misalignment"
     
-    # Session check
+    # Session check (now always passes)
     session = get_trading_session()
-    if not session_momentum_ok(session):
-        return False, "off_session"
+    # Removed filter
     
-    # Dealing range (must be in premium)
+    # Dealing range (optional)
     range_low, range_high = calculate_dealing_range(df15, "SHORT")
     current_price = df5["close"].iloc[-1]
     
+    in_zone = True
     if range_low and range_high:
-        if not (range_low <= current_price <= range_high):
-            return False, "outside_premium_zone"
+        in_zone = (range_low <= current_price <= range_high)
+    # Changed: Don't filter
     
-    # EMA compression → expansion
-    if not check_ema_setup(df5):
-        return False, "no_ema_setup"
+    # EMA compression → expansion (relaxed)
+    ema_setup = check_ema_setup(df5)
+    # Changed: Don't filter
     
-    # Displacement confirmation
+    # Displacement confirmation (still required)
     last_candle = df5.iloc[-1]
     atr = last_candle["atr"]
     vol_mean = df5["vol_mean"].iloc[-1]
@@ -535,16 +594,36 @@ def analyze_short_setup(df5, df15):
     if not check_displacement(last_candle, atr, vol_mean):
         return False, "weak_displacement"
     
-    # Liquidity distance
-    if not check_liquidity_distance(current_price, "SHORT", df5, atr):
+    # Liquidity distance (relaxed)
+    if not check_liquidity_distance_relaxed(current_price, "SHORT", df5, atr):
         return False, "too_close_to_liquidity"
     
     # Breakdown confirmation
     recent_low = df5["low"].iloc[-5:-1].min()
-    if current_price >= recent_low * 0.9995:
+    if current_price >= recent_low * 0.9997:  # Relaxed from 0.9995
         return False, "no_breakdown"
     
     return True, "valid_short_setup"
+
+def check_liquidity_distance_relaxed(price, direction, df, atr):
+    """Relaxed liquidity distance check (1.0× ATR instead of 1.5×)."""
+    highs, lows = find_liquidity_levels(df)
+    
+    min_distance = 1.0 * atr  # Relaxed from 1.5
+    
+    if direction == "LONG":
+        if not highs:
+            return True
+        nearest_high = min(highs, key=lambda x: abs(x - price))
+        distance = nearest_high - price
+        return distance >= min_distance
+    
+    else:  # SHORT
+        if not lows:
+            return True
+        nearest_low = min(lows, key=lambda x: abs(x - price))
+        distance = price - nearest_low
+        return distance >= min_distance
 
 # ======================================================
 # LAYER 7 — TRADE MANAGEMENT (STRUCTURE-BASED SL)
@@ -633,7 +712,12 @@ def capture_context(symbol, direction, entry, sl, atr, df5, df15):
     session = get_trading_session()
     
     sl_distance = abs(entry - sl)
-    sl_atr_ratio = sl_distance / (atr + 1e-10)
+    
+    # Safe ATR ratio calculation
+    if atr > 0 and not pd.isna(atr):
+        sl_atr_ratio = sl_distance / atr
+    else:
+        sl_atr_ratio = 2.0  # Default safe value
     
     # Classify SL size
     if sl_atr_ratio < 1.5:
@@ -643,9 +727,30 @@ def capture_context(symbol, direction, entry, sl, atr, df5, df15):
     else:
         sl_category = "wide"
     
-    # EMA trend strength
-    ema_sep_5 = abs(df5["ema9"].iloc[-1] - df5["ema50"].iloc[-1]) / df5["close"].iloc[-1]
+    # EMA trend strength - safe calculation
+    ema9 = df5["ema9"].iloc[-1]
+    ema50 = df5["ema50"].iloc[-1]
+    close = df5["close"].iloc[-1]
+    
+    if close > 0 and not pd.isna(ema9) and not pd.isna(ema50):
+        ema_sep_5 = abs(ema9 - ema50) / close
+    else:
+        ema_sep_5 = 0.01  # Default medium
+    
     trend_strength = "strong" if ema_sep_5 > 0.015 else "medium" if ema_sep_5 > 0.008 else "weak"
+    
+    # Safe volume ratio
+    vol_ratio = df5["vol_ratio"].iloc[-1]
+    if pd.isna(vol_ratio):
+        vol_ratio = 1.0
+    
+    # Safe ATR expansion
+    atr_curr = df5["atr"].iloc[-1]
+    atr_mean = df5["atr_mean"].iloc[-1]
+    if atr_mean > 0 and not pd.isna(atr_mean) and not pd.isna(atr_curr):
+        atr_expansion = atr_curr / atr_mean
+    else:
+        atr_expansion = 1.0
     
     context = {
         "regime": regime,
@@ -653,8 +758,8 @@ def capture_context(symbol, direction, entry, sl, atr, df5, df15):
         "sl_category": sl_category,
         "sl_atr_multiple": round(sl_atr_ratio, 2),
         "trend_strength": trend_strength,
-        "volume_ratio": round(df5["vol_ratio"].iloc[-1], 2),
-        "atr_expansion": round(df5["atr"].iloc[-1] / df5["atr_mean"].iloc[-1], 2),
+        "volume_ratio": round(vol_ratio, 2),
+        "atr_expansion": round(atr_expansion, 2),
         "pair_type": "major" if any(x in symbol for x in ["BTC", "ETH"]) else "alt"
     }
     
