@@ -676,43 +676,51 @@ def check_liquidity_distance_relaxed(price, direction, df, atr):
 
 def calculate_structure_sl(direction, entry, df, atr):
     """
-    SL = structure + 0.5× ATR buffer
-    No arbitrary ticks.
+    SL = structure + buffer (FIXED - much wider stops)
+    Minimum 2.5× ATR, maximum 4.0× ATR
     """
+    
+    # Ensure minimum distance
+    min_sl_distance = 2.5 * atr
+    max_sl_distance = 4.0 * atr
     
     if direction == "LONG":
         # Find recent swing low
         lows = []
-        for i in range(len(df)-15, len(df)-2):
-            if df["low"].iloc[i] < df["low"].iloc[i-1] and df["low"].iloc[i] < df["low"].iloc[i+1]:
-                lows.append(df["low"].iloc[i])
+        for i in range(len(df)-15, max(len(df)-40, 5), -1):
+            if i >= 2 and i < len(df) - 1:
+                if df["low"].iloc[i] < df["low"].iloc[i-1] and df["low"].iloc[i] < df["low"].iloc[i+1]:
+                    lows.append(df["low"].iloc[i])
         
         if lows:
             structure = min(lows)
-            sl = structure - (0.5 * atr)  # Buffer below structure
+            sl_distance = entry - structure + (0.5 * atr)  # Add buffer
+            
+            # Clamp to min/max
+            sl_distance = max(min_sl_distance, min(sl_distance, max_sl_distance))
+            return entry - sl_distance
         else:
-            sl = entry - (2.5 * atr)  # Fallback: minimum 2.5 ATR
-        
-        # Ensure minimum distance
-        min_sl = entry - (2.0 * atr)
-        return min(sl, min_sl)  # Use tighter of the two
+            # No structure found - use default
+            return entry - (2.5 * atr)
     
     else:  # SHORT
         # Find recent swing high
         highs = []
-        for i in range(len(df)-15, len(df)-2):
-            if df["high"].iloc[i] > df["high"].iloc[i-1] and df["high"].iloc[i] > df["high"].iloc[i+1]:
-                highs.append(df["high"].iloc[i])
+        for i in range(len(df)-15, max(len(df)-40, 5), -1):
+            if i >= 2 and i < len(df) - 1:
+                if df["high"].iloc[i] > df["high"].iloc[i-1] and df["high"].iloc[i] > df["high"].iloc[i+1]:
+                    highs.append(df["high"].iloc[i])
         
         if highs:
             structure = max(highs)
-            sl = structure + (0.5 * atr)  # Buffer above structure
+            sl_distance = structure - entry + (0.5 * atr)  # Add buffer
+            
+            # Clamp to min/max
+            sl_distance = max(min_sl_distance, min(sl_distance, max_sl_distance))
+            return entry + sl_distance
         else:
-            sl = entry + (2.5 * atr)  # Fallback
-        
-        # Ensure minimum distance
-        max_sl = entry + (2.0 * atr)
-        return max(sl, max_sl)
+            # No structure found - use default
+            return entry + (2.5 * atr)
 
 def calculate_targets(direction, entry, sl, df):
     """Calculate tiered profit targets."""
@@ -975,10 +983,6 @@ def analyze_trade_outcome(trade):
         # Regime issues
         if ctx["regime"] == "weak":
             reasons.append("⚠️ Weak regime - low conviction move")
-        
-        # Session issues
-        if ctx["session"] == "off_hours":
-            reasons.append("⚠️ Off-hours trade - low liquidity")
         
         # Trend issues
         if ctx["trend_strength"] == "weak":
@@ -1414,6 +1418,18 @@ def scanner_loop():
                                 # Calculate structure-based SL
                                 sl = calculate_structure_sl("LONG", entry, df5, atr)
                                 
+                                # CRITICAL: Validate SL distance
+                                sl_distance = abs(entry - sl)
+                                sl_percent = (sl_distance / entry) * 100
+                                
+                                if sl_distance < atr * 2.0:
+                                    log.warning(f"SL too tight for {symbol}: {sl_distance:.6f} < {atr*2.0:.6f}")
+                                    continue
+                                
+                                if sl_percent < 0.5:  # Less than 0.5% is insane
+                                    log.warning(f"SL percentage too tight for {symbol}: {sl_percent:.2f}%")
+                                    continue
+                                
                                 # Calculate targets
                                 tp1, tp2, tp3 = calculate_targets("LONG", entry, sl, df15)
                                 
@@ -1448,6 +1464,18 @@ def scanner_loop():
                                 
                                 # Calculate structure-based SL
                                 sl = calculate_structure_sl("SHORT", entry, df5, atr)
+                                
+                                # CRITICAL: Validate SL distance
+                                sl_distance = abs(entry - sl)
+                                sl_percent = (sl_distance / entry) * 100
+                                
+                                if sl_distance < atr * 2.0:
+                                    log.warning(f"SL too tight for {symbol}: {sl_distance:.6f} < {atr*2.0:.6f}")
+                                    continue
+                                
+                                if sl_percent < 0.5:  # Less than 0.5% is insane
+                                    log.warning(f"SL percentage too tight for {symbol}: {sl_percent:.2f}%")
+                                    continue
                                 
                                 # Calculate targets
                                 tp1, tp2, tp3 = calculate_targets("SHORT", entry, sl, df15)
