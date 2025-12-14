@@ -241,7 +241,7 @@ def get_df(ex, symbol, tf):
     return None
 
 # ======================================================
-# EXCHANGES (PRODUCTION-READY)
+# EXCHANGES (PRODUCTION-READY - FIXED)
 # ======================================================
 
 # Cache exchange instances
@@ -258,20 +258,14 @@ def get_ex(name):
         if name == "okx":
             ex = ccxt.okx({
                 'enableRateLimit': True,
-                'rateLimit': 100,  # Be gentle with rate limits
-                'timeout': 30000,
-                'options': {
-                    'defaultType': 'swap',  # Use perpetual swaps
-                }
+                'rateLimit': 100,
+                'timeout': 30000
             })
         elif name == "kucoin":
             ex = ccxt.kucoin({
                 'enableRateLimit': True,
                 'rateLimit': 100,
-                'timeout': 30000,
-                'options': {
-                    'defaultType': 'swap',
-                }
+                'timeout': 30000
             })
         else:
             log.error(f"Unknown exchange: {name}")
@@ -286,7 +280,7 @@ def get_ex(name):
         return None
 
 def get_pairs(ex):
-    """Get trading pairs with caching."""
+    """Get trading pairs - FIXED to work like original bot."""
     ex_name = ex.id if hasattr(ex, 'id') else 'unknown'
     
     # Refresh cache every 5 minutes
@@ -298,14 +292,9 @@ def get_pairs(ex):
     
     try:
         mk = ex.load_markets()
-        # Get USDT perpetual pairs
-        pairs = []
-        for symbol in mk:
-            if 'USDT' in symbol and mk[symbol].get('swap', False):
-                pairs.append(symbol)
         
-        # Limit to PAIR_LIMIT
-        pairs = pairs[:PAIR_LIMIT]
+        # Simple filter: just get USDT pairs like original bot
+        pairs = [s for s in mk if s.endswith("USDT")][:PAIR_LIMIT]
         
         # Cache results
         exchange_markets_cache[ex_name] = pairs
@@ -383,8 +372,7 @@ def detect_top_movers(ex):
 
 def check_regime(df_ltf, df_htf):
     """
-    Dual-timeframe regime check (RELAXED).
-    Focuses on LTF expansion primarily.
+    Dual-timeframe regime check (VERY RELAXED for more signals).
     """
     # Safety checks for valid data
     if pd.isna(df_htf["atr"].iloc[-1]) or pd.isna(df_htf["atr_mean"].iloc[-1]):
@@ -392,21 +380,16 @@ def check_regime(df_ltf, df_htf):
     if pd.isna(df_ltf["atr"].iloc[-1]) or pd.isna(df_ltf["atr_mean"].iloc[-1]):
         return False, "invalid_ltf_atr"
     
-    # HTF expansion (relaxed - just needs to not be contracting)
-    htf_atr_ok = df_htf["atr"].iloc[-1] >= df_htf["atr_mean"].iloc[-1] * 0.95  # Relaxed
+    # Very relaxed - just check LTF has some activity
+    ltf_atr = df_ltf["atr"].iloc[-1]
+    ltf_mean = df_ltf["atr_mean"].iloc[-1]
     
-    # LTF expansion (more important for scalping)
-    ltf_atr_ok = df_ltf["atr"].iloc[-1] > df_ltf["atr_mean"].iloc[-1] * 0.9  # Relaxed
-    ltf_vol_ok = df_ltf["vol_ratio"].iloc[-1] > 0.8  # Relaxed from 1.0
+    # Accept if LTF ATR is at least 70% of mean (very lenient)
+    ltf_atr_ok = ltf_atr >= ltf_mean * 0.7
     
-    # KILL SWITCH: HTF expanding but LTF contracting = divergence
-    htf_expanding = df_htf["atr"].iloc[-1] > df_htf["atr"].iloc[-2]
-    ltf_contracting = df_ltf["atr"].iloc[-1] < df_ltf["atr"].iloc[-2] * 0.95
+    # Volume just needs to exist
+    ltf_vol_ok = df_ltf["vol_ratio"].iloc[-1] > 0.5
     
-    if htf_expanding and ltf_contracting:
-        return False, "regime_divergence"
-    
-    # Accept if LTF looks good (even if HTF is weak)
     if ltf_atr_ok and ltf_vol_ok:
         return True, "clean_expansion"
     
@@ -559,19 +542,16 @@ def session_momentum_ok(session):
 # ======================================================
 
 def check_displacement(candle, atr, vol_mean):
-    """Verify clean, immediate displacement."""
+    """Verify displacement (SIMPLIFIED)."""
     
-    # Range must exceed ATR significantly
-    range_ok = candle["range"] >= atr * 1.2
+    # Range should be decent
+    range_ok = candle["range"] >= atr * 0.8  # Relaxed from 1.2
     
-    # Volume confirmation
-    volume_ok = candle["volume"] >= vol_mean * 1.3
+    # Volume confirmation (relaxed)
+    volume_ok = candle["volume"] >= vol_mean * 1.0  # Relaxed from 1.3
     
-    # Body ratio (avoid long wicks)
-    body_ok = candle["body_ratio"] >= 0.55
-    
-    # Not an inside bar
-    not_inside = True  # Would need previous candle to check
+    # Body ratio (avoid dojis)
+    body_ok = candle["body_ratio"] >= 0.4  # Relaxed from 0.55
     
     return range_ok and volume_ok and body_ok
 
@@ -599,91 +579,22 @@ def check_ema_setup(df):
 # ======================================================
 
 def analyze_long_setup(df5, df15):
-    """Complete long setup analysis."""
+    """Long setup analysis (SIMPLIFIED for more signals)."""
     
-    # Check regime first
+    # Check regime (relaxed now)
     regime_ok, regime_reason = check_regime(df5, df15)
     if not regime_ok:
         return False, regime_reason
     
-    # Trend alignment
+    # Trend alignment (simplified)
     trend_ok = (
-        df5["ema9"].iloc[-1] > df5["ema20"].iloc[-1] > df5["ema50"].iloc[-1] and
-        df15["ema9"].iloc[-1] > df15["ema20"].iloc[-1]
+        df5["ema9"].iloc[-1] > df5["ema20"].iloc[-1] and
+        df5["ema20"].iloc[-1] > df5["ema50"].iloc[-1]
     )
     if not trend_ok:
         return False, "trend_misalignment"
     
-    # Session check (now always passes, but logged for learning)
-    session = get_trading_session()
-    # Removed: if not session_momentum_ok(session): return False
-    
-    # Dealing range (optional - warn but don't filter)
-    range_low, range_high = calculate_dealing_range(df15, "LONG")
-    current_price = df5["close"].iloc[-1]
-    
-    in_zone = True
-    if range_low and range_high:
-        in_zone = (range_low <= current_price <= range_high)
-    # Changed: Don't filter, just track for learning
-    
-    # EMA compression → expansion (relaxed)
-    ema_setup = check_ema_setup(df5)
-    # Changed: Warn but don't filter
-    
-    # Displacement confirmation (still required)
-    last_candle = df5.iloc[-1]
-    atr = last_candle["atr"]
-    vol_mean = df5["vol_mean"].iloc[-1]
-    
-    if not check_displacement(last_candle, atr, vol_mean):
-        return False, "weak_displacement"
-    
-    # Liquidity distance (relaxed to 1.0× ATR instead of 1.5×)
-    if not check_liquidity_distance_relaxed(current_price, "LONG", df5, atr):
-        return False, "too_close_to_liquidity"
-    
-    # Breakout confirmation
-    recent_high = df5["high"].iloc[-5:-1].max()
-    if current_price <= recent_high * 1.0003:  # Relaxed from 1.0005
-        return False, "no_breakout"
-    
-    return True, "valid_long_setup"
-
-def analyze_short_setup(df5, df15):
-    """Complete short setup analysis."""
-    
-    # Check regime first
-    regime_ok, regime_reason = check_regime(df5, df15)
-    if not regime_ok:
-        return False, regime_reason
-    
-    # Trend alignment
-    trend_ok = (
-        df5["ema9"].iloc[-1] < df5["ema20"].iloc[-1] < df5["ema50"].iloc[-1] and
-        df15["ema9"].iloc[-1] < df15["ema20"].iloc[-1]
-    )
-    if not trend_ok:
-        return False, "trend_misalignment"
-    
-    # Session check (now always passes)
-    session = get_trading_session()
-    # Removed filter
-    
-    # Dealing range (optional)
-    range_low, range_high = calculate_dealing_range(df15, "SHORT")
-    current_price = df5["close"].iloc[-1]
-    
-    in_zone = True
-    if range_low and range_high:
-        in_zone = (range_low <= current_price <= range_high)
-    # Changed: Don't filter
-    
-    # EMA compression → expansion (relaxed)
-    ema_setup = check_ema_setup(df5)
-    # Changed: Don't filter
-    
-    # Displacement confirmation (still required)
+    # Displacement confirmation
     last_candle = df5.iloc[-1]
     atr = last_candle["atr"]
     vol_mean = df5["vol_mean"].iloc[-1]
@@ -692,35 +603,72 @@ def analyze_short_setup(df5, df15):
         return False, "weak_displacement"
     
     # Liquidity distance (relaxed)
+    current_price = df5["close"].iloc[-1]
+    if not check_liquidity_distance_relaxed(current_price, "LONG", df5, atr):
+        return False, "too_close_to_liquidity"
+    
+    # Simple breakout check
+    recent_high = df5["high"].iloc[-5:-1].max()
+    if current_price <= recent_high:
+        return False, "no_breakout"
+    
+    return True, "valid_long_setup"
+
+def analyze_short_setup(df5, df15):
+    """Short setup analysis (SIMPLIFIED for more signals)."""
+    
+    # Check regime (relaxed now)
+    regime_ok, regime_reason = check_regime(df5, df15)
+    if not regime_ok:
+        return False, regime_reason
+    
+    # Trend alignment (simplified)
+    trend_ok = (
+        df5["ema9"].iloc[-1] < df5["ema20"].iloc[-1] and
+        df5["ema20"].iloc[-1] < df5["ema50"].iloc[-1]
+    )
+    if not trend_ok:
+        return False, "trend_misalignment"
+    
+    # Displacement confirmation
+    last_candle = df5.iloc[-1]
+    atr = last_candle["atr"]
+    vol_mean = df5["vol_mean"].iloc[-1]
+    
+    if not check_displacement(last_candle, atr, vol_mean):
+        return False, "weak_displacement"
+    
+    # Liquidity distance (relaxed)
+    current_price = df5["close"].iloc[-1]
     if not check_liquidity_distance_relaxed(current_price, "SHORT", df5, atr):
         return False, "too_close_to_liquidity"
     
-    # Breakdown confirmation
+    # Simple breakdown check
     recent_low = df5["low"].iloc[-5:-1].min()
-    if current_price >= recent_low * 0.9997:  # Relaxed from 0.9995
+    if current_price >= recent_low:
         return False, "no_breakdown"
     
     return True, "valid_short_setup"
 
 def check_liquidity_distance_relaxed(price, direction, df, atr):
-    """Relaxed liquidity distance check (1.0× ATR instead of 1.5×)."""
+    """Very relaxed liquidity distance check."""
     highs, lows = find_liquidity_levels(df)
     
-    min_distance = 1.0 * atr  # Relaxed from 1.5
+    min_distance = 0.5 * atr  # Very relaxed - just avoid being right on top
     
     if direction == "LONG":
         if not highs:
             return True
         nearest_high = min(highs, key=lambda x: abs(x - price))
         distance = nearest_high - price
-        return distance >= min_distance
+        return distance >= min_distance or distance < 0  # Also allow if already past
     
     else:  # SHORT
         if not lows:
             return True
         nearest_low = min(lows, key=lambda x: abs(x - price))
         distance = price - nearest_low
-        return distance >= min_distance
+        return distance >= min_distance or distance < 0  # Also allow if already past
 
 # ======================================================
 # LAYER 7 — TRADE MANAGEMENT (STRUCTURE-BASED SL)
@@ -1436,6 +1384,7 @@ def scanner_loop():
                     log.info(f"📈 Checking {len(movers)} top movers on {ex_name}")
                     
                     signals_found = 0
+                    filtered_reasons = defaultdict(int)  # Track why setups fail
                     
                     for symbol in movers:
                         try:
@@ -1482,7 +1431,9 @@ def scanner_loop():
                                     signals_found += 1
                                     scanner_health["total_signals"] += 1
                                 else:
-                                    log.info(f"❌ Filtered {symbol} LONG: {filter_reason}")
+                                    filtered_reasons[filter_reason] += 1
+                            else:
+                                filtered_reasons[long_reason] += 1
                             
                             # Check for SHORT setup
                             short_valid, short_reason = analyze_short_setup(df5, df15)
@@ -1515,7 +1466,9 @@ def scanner_loop():
                                     signals_found += 1
                                     scanner_health["total_signals"] += 1
                                 else:
-                                    log.info(f"❌ Filtered {symbol} SHORT: {filter_reason}")
+                                    filtered_reasons[filter_reason] += 1
+                            else:
+                                filtered_reasons[short_reason] += 1
                         
                         except Exception as e:
                             log.error(f"❌ Error scanning {symbol}: {str(e)[:100]}")
@@ -1523,6 +1476,12 @@ def scanner_loop():
                     
                     if signals_found > 0:
                         log.info(f"✅ {signals_found} signals sent from {ex_name}")
+                    
+                    # Log top rejection reasons
+                    if filtered_reasons:
+                        top_reasons = sorted(filtered_reasons.items(), key=lambda x: x[1], reverse=True)[:3]
+                        reason_str = ", ".join([f"{reason}: {count}" for reason, count in top_reasons])
+                        log.info(f"📉 Top rejection reasons on {ex_name}: {reason_str}")
                     
                     # Small delay between exchanges
                     time.sleep(1)
